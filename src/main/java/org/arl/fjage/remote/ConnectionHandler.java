@@ -138,6 +138,11 @@ class ConnectionHandler extends Thread {
   synchronized void println(String s) {
     if (out == null) return;
     try {
+      int delay = (int)(Math.random() * 1000 - 500);
+      if (delay < 0) delay = 0;
+      try {
+        Thread.sleep(delay);
+      }catch(InterruptedException ex){}
       out.writeBytes(s+"\n");
       log.fine(this.getName() +" >>> "+s);
       conn.waitOutputCompletion(1000);
