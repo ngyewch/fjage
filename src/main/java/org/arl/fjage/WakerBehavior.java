@@ -118,5 +118,20 @@ public class WakerBehavior extends Behavior {
     quit = false;
   }
 
-}
+  /**
+   * Creates a new WakerBehavior which runs the specified Runnable once the specified delay expires.
+   *
+   * @param millis Delay in milliseconds.
+   * @param runnable Runnable to run.
+   * @return WakerBehavior
+   */
+  public static WakerBehavior create(long millis, final Runnable runnable) {
+    return new WakerBehavior(millis) {
 
+      @Override
+      public void onWake() {
+        runnable.run();
+      }
+    };
+  }
+}
