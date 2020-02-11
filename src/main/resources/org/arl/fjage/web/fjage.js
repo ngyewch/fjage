@@ -296,7 +296,7 @@ export class Gateway {
    * @param {string} pathname - path of the master container to connect to
    */
   constructor(hostname=window.location.hostname, port=window.location.port, pathname='/ws/') {
-    var url = new URL('ws://locahost');
+    var url = new URL('ws://localhost');
     url.hostname = hostname;
     url.port = port || 80;
     url.pathname = pathname;
@@ -427,10 +427,11 @@ export class Gateway {
   // returns a Promise
   _websockTxRx(rq) {
     rq.id = _guid(8);
-    return new Promise((resolve, reject) => {
+    return new Promise(resolve => {
       let timer = setTimeout(() => {
         delete this.pending[rq.id];
-        reject(new Error('Receive Timeout : ' + rq));
+        if (this.debug) console.log('Receive Timeout : ' + rq);
+        resolve();
       }, this.sock.readyState == this.sock.CONNECTING ? 8*TIMEOUT : TIMEOUT);
       this.pending[rq.id] = rsp => {
         clearTimeout(timer);
@@ -439,7 +440,8 @@ export class Gateway {
       if (!this._websockTx.call(this,rq)) {
         clearTimeout(timer);
         delete this.pending[rq.id];
-        reject(new Error('Transmit Error : ' + rq));
+        if (this.debug) console.log('Transmit Timeout : ' + rq);
+        resolve();
       }
     });
   }
@@ -451,6 +453,10 @@ export class Gateway {
     var filtMsgs = this.queue.filter( msg => {
       if (typeof filter == 'string' || filter instanceof String) {
         return 'inReplyTo' in msg && msg.inReplyTo == filter;
+      } else if (Object.prototype.hasOwnProperty.call(filter, 'msgID')) {
+        return 'inReplyTo' in msg && msg.inReplyTo == filter.msgID;
+      }else if (filter.__proto__.name == 'Message'){
+        return filter.__clazz__ == msg.__clazz__;
       }else if (typeof filter ==  'function' ){
         return filter(msg);
       }else{
@@ -584,6 +590,7 @@ export class Gateway {
   async agentForService(service) {
     let rq = { action: 'agentForService', service: service };
     let rsp = await this._websockTxRx(rq);
+    if (!rsp || !rsp.agentID) return;
     return new AgentID(rsp.agentID, false, this);
   }
 
@@ -597,6 +604,7 @@ export class Gateway {
     let rq = { action: 'agentsForService', service: service };
     let rsp = await this._websockTxRx(rq);
     let aids = [];
+    if (!rsp || !Array.isArray(rsp.agentIDs)) return aids;
     for (var i = 0; i < rsp.agentIDs.length; i++)
       aids.push(new AgentID(rsp.agentIDs[i], false, this));
     return aids;
@@ -638,8 +646,7 @@ export class Gateway {
    */
   async request(msg, timeout=1000) {
     this.send(msg);
-    let rsp = await this.receive(msg.msgID, timeout);
-    return rsp;
+    return this.receive(msg, timeout);
   }
 
   /**
@@ -650,14 +657,15 @@ export class Gateway {
    * @return {Message} received response message, null on timeout.
    */
   receive(filter=undefined, timeout=0) {
-    return new Promise((resolve, reject) => {
+    return new Promise(resolve => {
       let msg = this._getMessageFromQueue.call(this,filter);
       if (msg) {
         resolve(msg);
         return;
       }
       if (timeout == 0) {
-        reject(new Error('Receive Timeout : ' + filter));
+        if (this.debug) console.log('Receive Timeout : ' + filter);
+        resolve();
         return;
       }
       let lid = _guid(8);
@@ -665,7 +673,8 @@ export class Gateway {
       if (timeout > 0){
         timer = setTimeout(() => {
           delete this.listener[lid];
-          reject(new Error('Receive Timeout : ' + filter));
+          if (this.debug) console.log('Receive Timeout : ' + filter);
+          resolve();
         }, timeout);
       }
       this.listener[lid] = () => {
@@ -723,5 +732,6 @@ export function MessageClass(name) {
       }
     }
   };
+  window[sname].__clazz__ = name;
   return window[sname];
 }
