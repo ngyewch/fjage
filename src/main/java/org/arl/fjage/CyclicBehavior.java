@@ -22,6 +22,26 @@ public class CyclicBehavior extends Behavior {
 
   private boolean quit = false;
 
+  ////////// Interface methods
+
+  /**
+   * Creates a behavior that is executed cyclically.
+   */
+  public CyclicBehavior() {
+  }
+
+  /**
+   * Creates a behavior that is executed cyclically.
+   *
+   * @param runnable Runnable to run.
+   */
+  public CyclicBehavior(Runnable runnable) {
+    this();
+    if (runnable != null) {
+      this.action = param -> runnable.run();
+    }
+  }
+
   //////////// Overridden methods
 
   /**
@@ -40,21 +60,5 @@ public class CyclicBehavior extends Behavior {
    */
   public final void stop() {
     quit = true;
-  }
-
-  /**
-   * Creates a new CyclicBehavior which runs the specified Runnable cyclically.
-   *
-   * @param runnable Runnable to run.
-   * @return CyclicBehavior
-   */
-  public static CyclicBehavior create(final Runnable runnable) {
-    return new CyclicBehavior() {
-
-      @Override
-      public void action() {
-        runnable.run();
-      }
-    };
   }
 }
