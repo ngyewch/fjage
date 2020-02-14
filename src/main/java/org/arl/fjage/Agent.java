@@ -11,9 +11,7 @@ for full license details.
 package org.arl.fjage;
 
 import java.io.Serializable;
-import java.util.ArrayDeque;
-import java.util.Iterator;
-import java.util.Queue;
+import java.util.*;
 import java.util.TimerTask;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -80,14 +78,16 @@ public class Agent implements Runnable, TimestampProvider, Messenger {
   private AgentID aid = null;
   private volatile AgentState state = AgentState.INIT;
   private volatile AgentState oldState = AgentState.NONE;
-  private Queue<Behavior> newBehaviors = new ArrayDeque<Behavior>();
-  private Queue<Behavior> activeBehaviors = new ArrayDeque<Behavior>();
-  private Queue<Behavior> blockedBehaviors = new ArrayDeque<Behavior>();
+  private Queue<Behavior> newBehaviors = new ArrayDeque<>();
+  private Queue<Behavior> activeBehaviors = new PriorityQueue<>();
+  private Queue<Behavior> blockedBehaviors = new ArrayDeque<>();
+  private Stack<MessageFilter> exclusions = new Stack<>();
   private volatile boolean restartBehaviors = false;
   private boolean unblocked = false;
   private Platform platform = null;
   private Container container = null;
   private MessageQueue queue = new MessageQueue(256);
+  private boolean yieldDuringReceive = true;
   protected long tid = -1;
   protected Thread thread = null;
   protected boolean ignoreExceptions = false;
@@ -255,7 +255,7 @@ public class Agent implements Runnable, TimestampProvider, Messenger {
    * @param b behavior to be added.
    * @return the behavior (same as input b)
    */
-  public Behavior add(Behavior b) {
+  public synchronized Behavior add(Behavior b) {
     b.setOwner(this);
     newBehaviors.add(b);
     wake();
@@ -410,22 +410,47 @@ public class Agent implements Runnable, TimestampProvider, Messenger {
       c.send(m);
   }
 
+  /**
+   * Enables/disables processing of messages during a blocking receive(). Until fjage 1.6,
+   * incoming message processing was suspended during receive(). From fjage 1.7, incoming
+   * messages are processed while waiting to receive intended message. This can be disabled,
+   * if desired for backward compatibility.
+   *
+   * @param b true to process messages while waiting, false to disable processing.
+   */
+  protected void setYieldDuringReceive(boolean b) {
+    yieldDuringReceive = b;
+  }
+
+  /**
+   * Checks if messages will be processed during a blocking receive().
+   * @see #setYieldDuringReceive(boolean)
+   */
+  protected boolean getYieldDuringReceive() {
+    return yieldDuringReceive;
+  }
+
   @Override
-  public synchronized Message receive(MessageFilter filter, long timeout) {
+  public Message receive(MessageFilter filter, long timeout) {
     if (Thread.currentThread().getId() != tid)
       throw new FjageException("receive() should only be called from agent thread");
     long deadline = 0;
+    queue.commit(exclusions);
     Message m = queue.get(filter);
     if (m == null && timeout != NON_BLOCKING) {
       if (timeout != BLOCKING) deadline = currentTimeMillis() + timeout;
       do {
-        if (timeout == BLOCKING) block();
-        else {
+        exclusions.push(filter);
+        if (timeout == BLOCKING) {
+          if (!yieldDuringReceive || !executeBehavior()) block();
+        } else if (!yieldDuringReceive || !executeBehavior()) {
           long t = deadline - currentTimeMillis();
           block(t);
         }
+        exclusions.pop();
         if (Thread.interrupted()) return null;
         if (state == AgentState.FINISHING) return null;
+        queue.commit(exclusions);
         m = queue.get(filter);
       } while (m == null && (timeout == BLOCKING || currentTimeMillis() < deadline));
     }
@@ -699,6 +724,57 @@ public class Agent implements Runnable, TimestampProvider, Messenger {
     }
   }
 
+  // returns false if no pending behaviors, true otherwise
+  private boolean executeBehavior() {
+    // restart necessary blocked behaviors
+    if (restartBehaviors) {
+      synchronized (this) {
+        restartBehaviors = false;
+        activeBehaviors.addAll(blockedBehaviors);
+        blockedBehaviors.clear();
+        queue.commit(exclusions);
+      }
+    } else {
+      Iterator<Behavior> iterator = blockedBehaviors.iterator();
+      while (iterator.hasNext()) {
+        Behavior b = iterator.next();
+        if (!b.isBlocked()) {
+          iterator.remove();
+          activeBehaviors.add(b);
+        }
+      }
+    }
+    try {
+      // assimilate any new behaviors
+      Behavior b = newBehaviors.poll();
+      if (b != null) {
+        activeBehaviors.add(b);
+        b.onStart();
+        return true;
+      }
+      // execute an active behavior
+      b = activeBehaviors.poll();
+      if (b != null) {
+        b.unblock();
+        b.action();
+        if (b.done()) {
+          b.onEnd();
+          b.setOwner(null);
+        } else {
+          if (b.isBlocked()) blockedBehaviors.add(b);
+          else activeBehaviors.add(b);
+        }
+        return true;
+      }
+    } catch (Throwable ex) {
+      if (ignoreExceptions) log.log(Level.WARNING, "Exception in agent: "+aid, ex);
+      else throw(ex);
+    }
+    synchronized (this) {
+      return (newBehaviors.size() > 0);
+    }
+  }
+
   /**
    * Lifecycle of the agent. Called by the container as needed.
    *
@@ -717,50 +793,7 @@ public class Agent implements Runnable, TimestampProvider, Messenger {
         Thread.interrupted(); // interrupts used for disrupting timeouts only
       }
       while (state != AgentState.FINISHING) {
-        // restart necessary blocked behaviors
-        if (restartBehaviors) {
-          synchronized (this) {
-            restartBehaviors = false;
-            activeBehaviors.addAll(blockedBehaviors);
-            blockedBehaviors.clear();
-          }
-        } else {
-          Iterator<Behavior> iterator = blockedBehaviors.iterator();
-          while (iterator.hasNext()) {
-            Behavior b = iterator.next();
-            if (!b.isBlocked()) {
-              iterator.remove();
-              activeBehaviors.add(b);
-            }
-          }
-        }
-        // assimilate any new behaviors
-        try {
-          Behavior b = newBehaviors.poll();
-          if (b != null) {
-            activeBehaviors.add(b);
-            b.onStart();
-            continue;
-          }
-          // execute an active behavior
-          b = activeBehaviors.poll();
-          if (b != null) {
-            b.unblock();
-            b.action();
-            if (b.done()) {
-              b.onEnd();
-              b.setOwner(null);
-            } else {
-              if (b.isBlocked()) blockedBehaviors.add(b);
-              else activeBehaviors.add(b);
-            }
-            continue;
-          }
-        } catch (Throwable ex) {
-          if (ignoreExceptions) log.log(Level.WARNING, "Exception in agent: "+aid, ex);
-          else throw(ex);
-        }
-        block();
+        if (!executeBehavior()) block();
         Thread.interrupted(); // interrupts used for disrupting timeouts only
       }
     } catch (Throwable ex) {
@@ -783,4 +816,3 @@ public class Agent implements Runnable, TimestampProvider, Messenger {
   }
 
 }
-

@@ -23,6 +23,7 @@ public class FjageException extends RuntimeException {
     super(message);
   }
 
+  @Override
   public String toString() {
     String s = getMessage();
     if (s != null) return s;

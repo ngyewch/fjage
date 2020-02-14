@@ -11,13 +11,14 @@ for full license details.
 package org.arl.fjage.shell;
 
 import org.arl.fjage.*;
+import org.arl.fjage.param.ParameterMessageBehavior;
 
 import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.Callable;
-import java.nio.file.Files;
-import java.nio.file.Paths;
-import java.nio.file.Path;
 
 /**
  * Shell agent runs in a container and allows execution of shell commands and scripts.
@@ -134,6 +135,9 @@ public class ShellAgent extends Agent {
   public void init() {
     log.info("Agent "+getName()+" init");
     if (!ephemeral) register(Services.SHELL);
+
+    // support parameters
+    add(new ParameterMessageBehavior(ShellParam.class));
 
     // behavior to exec in agent's thread
     executor = new CyclicBehavior() {
@@ -431,6 +435,18 @@ public class ShellAgent extends Agent {
     return enabled;
   }
 
+  /**
+   * Get supported script language.
+   *
+   * @return supported language, or null if unknown.
+   */
+  public String getLanguage() {
+    if (engine == null) return null;
+    String lang = engine.getClass().getSimpleName();
+    if (lang.endsWith("ScriptEngine")) lang = lang.substring(0, lang.length()-"ScriptEngine".length());
+    return lang;
+  }
+
   @Override
   public String toString() {
     if (shell == null || engine == null) return super.toString();
@@ -587,31 +603,50 @@ public class ShellAgent extends Agent {
     byte[] contents = req.getContents();
     File f = new File(filename);
     Message rsp = null;
-    FileOutputStream os = null;
+    Closeable os = null;
+    long ofs = req.getOffset();
     try {
-      if (contents == null) {
-        if (filename.endsWith("/") || filename.endsWith(File.separator)){
-          Path pathToBeDeleted = Paths.get(filename);
+      boolean fileIsDir = filename.endsWith("/") || filename.endsWith(File.separator);
+      if (fileIsDir) {
+        if (ofs == 0) {
+          if (contents == null) {
+            Path pathToBeDeleted = Paths.get(filename);
 
-          Files.walk(pathToBeDeleted)
-            .sorted(Comparator.reverseOrder())
-            .map(Path::toFile)
-            .forEach(File::delete);
+            Files.walk(pathToBeDeleted)
+                    .sorted(Comparator.reverseOrder())
+                    .map(Path::toFile)
+                    .forEach(File::delete);
 
-          rsp = new Message(req, Performative.AGREE);
-        }
-        else if (f.delete()) rsp = new Message(req, Performative.AGREE);
-      } else if (filename.endsWith("/") || filename.endsWith(File.separator)){
-        if(!f.exists()){
-          f.mkdir();
-          rsp = new Message(req, Performative.AGREE);
+            rsp = new Message(req, Performative.AGREE);
+          } else {
+            if (!f.exists()) rsp = new Message(req, f.mkdir() ? Performative.AGREE : Performative.FAILURE);
+          }
         }
       } else {
-        os = new FileOutputStream(f);
-        os.write(contents);
-        os.flush();
-        os.getFD().sync();
-        rsp = new Message(req, Performative.AGREE);
+        if (contents == null && ofs == 0) {
+          if (f.delete()) rsp = new Message(req, Performative.AGREE);
+        } else if (contents == null) {
+          os = new RandomAccessFile(f, "rw");
+          ((RandomAccessFile) os).setLength(ofs);
+          rsp = new Message(req, Performative.AGREE);
+        } else {
+          if (ofs == f.length()) {
+            // Append if ofs != 0
+            os = new FileOutputStream(f, ofs != 0);
+            ((FileOutputStream) os).write(contents);
+            ((FileOutputStream) os).flush();
+            ((FileOutputStream) os).getFD().sync();
+          } else {
+            // Overwrite if ofs == 0
+            os = new RandomAccessFile(f, "rw");
+            if(ofs >= 0)((RandomAccessFile) os).setLength(ofs + contents.length);
+            if (ofs > 0) ((RandomAccessFile) os).skipBytes((int) ofs);
+            else if (ofs < 0) ((RandomAccessFile) os).skipBytes((int) (f.length() + ofs));
+            ((RandomAccessFile) os).write(contents);
+            ((RandomAccessFile) os).getFD().sync();
+          }
+          rsp = new Message(req, Performative.AGREE);
+        }
       }
     } catch (IOException ex) {
       log.warning(ex.toString());

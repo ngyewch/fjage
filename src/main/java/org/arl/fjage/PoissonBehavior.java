@@ -137,4 +137,10 @@ public class PoissonBehavior extends Behavior {
     ticks = 0;
     quit = false;
   }
+
+  @Override
+  public int getPriority() {
+    return Integer.MIN_VALUE;
+  }
+
 }

@@ -94,6 +94,24 @@ public class MessageBehavior extends Behavior {
     }
   }
 
+  /**
+   * Checks if this MessageBehavior has a filter associated with it.
+   */
+  boolean hasFilter() {
+    return filter != null;
+  }
+
+  /**
+   * Check if this MessageBehavior accepts a specific message.
+   *
+   * @param msg message to check.
+   * @return true if it accepts, false otherwise.
+   */
+  public boolean accepts(Message msg) {
+    if (filter == null) return true;
+    return filter.matches(msg);
+  }
+
   //////////// Method to be overridden by subclass
 
   /**
@@ -134,4 +152,15 @@ public class MessageBehavior extends Behavior {
   public final boolean done() {
     return false;
   }
+
+  /**
+   * Message behaviors with filters return a priority value of -100 to allow them to be
+   * executed before general message behaviors (no filters, priority value of 0).
+   */
+  @Override
+  public int getPriority() {
+    if (filter != null) return -100;
+    return 0;
+  }
+
 }

@@ -1,5 +1,32 @@
 # Release Notes
 
+## v1.6.5
+
+* Javascript gateway bug fixes
+* Fixed bug in PutFileReq, causing file overwrites to possibly end up with junk at end
+* Fixed bug causing null fields in message to complain about bad JSON
+* Fixed bug causing concurrent modification exception during intermittent Javscript gateway connection
+* Fixed bug causing an harmless null pointer expection during termination
+
+## v1.6.4
+
+* Bug fix related to behaviors added from a different thread
+* Jetty version update
+
+## v1.6.3
+
+* Added null checks in connector streams
+* Fixed encoding for unicode strings
+* Aligned Javascript API to other language APIs
+* Added support to FilePutReq to write file in chunks (append file)
+
+## v1.6.2
+
+* Bug fixes in C, Javascript and Python gatways
+* Bug fixes in shell agent, and handling of ANSI sequences
+* Minor performance fixes
+* Added method to access currently running web servers
+
 ## v1.6.1
 
 * Minor fixes in fjagepy
