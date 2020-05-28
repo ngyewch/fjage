@@ -1,3 +1,7 @@
+plugins {
+  id("com.github.ngyewch.gradle-fjage-plugin") version "0.4.0"
+}
+
 apply plugin: 'groovy'
 apply plugin: 'eclipse'
 apply plugin: 'maven'
@@ -152,4 +156,10 @@ uploadArchives {
       }
     }
   }
+}
+
+// run via ./gradlew run-lambda-support --console=plain --no-daemon
+tasks.register("run-lambda-support", org.arl.fjage.gradle.FjageGroovyBootTask) {
+  scripts = ["etc/initrc-console-shell", "scripts/lambda-support"]
+  systemProperties = ["java.util.logging.config.file": "logging.properties"]
 }
