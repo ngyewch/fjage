@@ -28,7 +28,7 @@ function fjageMessageChecker() {
 
       if (!msg.message) return ret;
 
-      ret = ret && (!msg.message.clazz || typeof msg.message.clazz === "string");
+      ret = ret && (!msg.message.clazz || typeof msg.message.clazz === 'string');
 
       if (!msg.message.data) return ret;
 
@@ -229,6 +229,110 @@ describe('An AgentID', function () {
     expect(aid.isTopic()).toBe(true);
     expect(aid.toJSON()).toBe('#agent-name');
   });
+
+  it('should get the value of a single parameter', async function () {
+    const aid = new AgentID('S', false, gw);
+    let val = await aid.get('y');
+    expect(val).toEqual(2);
+  });
+
+  it('should return null if asked to get the value of unknown parameter', async function () {
+    const aid = new AgentID('S', false, gw);
+    let val = await aid.get('k');
+    expect(val).toEqual(null);
+  });
+
+  it('should set the value of a single parameter and return the new value', async function () {
+    const aid = new AgentID('S', false, gw);
+    let val = await aid.set('a', 42);
+    expect(val).toEqual(42);
+    val = await aid.set('a', 0);
+    expect(val).toEqual(0);
+  });
+
+  it('should return null if asked to set the value of unknown parameter',  async function () {
+    const aid = new AgentID('S', false, gw);
+    let val = await aid.set('k', 42);
+    expect(val).toEqual(null);
+  });
+
+  it('should get the values of an array of parameters', async function () {
+    const aid = new AgentID('S', false, gw);
+    let val = await aid.get(['y', 's']);
+    expect(val).toEqual([2, 'xxx']);
+  });
+
+  it('should set the values of an array of parameters and return the new values',  async function () {
+    const aid = new AgentID('S', false, gw);
+    let val = await aid.set(['a','b'], [42, -32.876]);
+    expect(val).toEqual([42, -32.876]);
+    val = await aid.set(['a','b'], [0, 42]);
+    expect(val).toEqual([0, 42]);
+  });
+
+  it('should get the values of all parameter on a Agent', async function () {
+    const aid = new AgentID('S', false, gw);
+    let val = await aid.get();
+    expect(val).toEqual({
+      'org.arl.fjage.test.Params.x': 1,
+      'org.arl.fjage.test.Params.y': 2,
+      'org.arl.fjage.test.Params.z': 2,
+      'org.arl.fjage.test.Params.s': 'xxx',
+      'org.arl.fjage.test.Params.a': 0,
+      'org.arl.fjage.test.Params.b': 42
+    });
+  });
+
+  it('should get the value of a single indexed parameter', async function () {
+    const aid = new AgentID('S', false, gw);
+    let val = await aid.get('z', 1);
+    expect(val).toEqual(4);
+  });
+
+  it('should return null if asked to get the value of unknown indexed parameter', async function () {
+    const aid = new AgentID('S', false, gw);
+    let val = await aid.get('k', 1);
+    expect(val).toEqual(null);
+  });
+
+  it('should set the value of a single indexed parameter and return the new value',  async function () {
+    const aid = new AgentID('S', false, gw);
+    let val = await aid.set('z', 42, 1);
+    expect(val).toEqual(42);
+    val = await aid.set('z', 4, 1);
+    expect(val).toEqual(4);
+  });
+
+  it('should return null if asked to set the value of unknown indexed parameter', async function () {
+    const aid = new AgentID('S', false, gw);
+    let val = await aid.get('k', 1);
+    expect(val).toEqual(null);
+  });
+
+  it('should get the values of an array of indexed parameters',  async function () {
+    const aid = new AgentID('S', false, gw);
+    let val = await aid.get(['y', 's'], 1);
+    expect(val).toEqual([3, 'yyy']);
+  });
+
+  it('should set the values of an array of indexed parameters and return the new values', async function () {
+    const aid = new AgentID('S', false, gw);
+    let val = await aid.set(['z', 's'], [42, 'boo'], 1);
+    expect(val).toEqual([42, 'yyy']);
+    val = await aid.set('z', 4, 1);
+    expect(val).toEqual(4);
+  });
+
+  it('should get the values of all indexed parameter on a Agent', async function () {
+    const aid = new AgentID('S', false, gw);
+    let val = await aid.get(null, 1);
+    expect(val).toEqual({
+      'org.arl.fjage.test.Params.z': 4,
+      'org.arl.fjage.test.Params.s': 'yyy',
+      'org.arl.fjage.test.Params.y': 3
+    });
+  });
+
 });
 
 describe('A Message', function () {
@@ -254,6 +358,32 @@ describe('A Message', function () {
     const txMsg = new TxFrameReq();
     expect(msg1).toEqual(msg2);
     expect(Message._deserialize(txMsg._serialize())).toEqual(txMsg);
+  });
+});
+
+describe('A MessageClass', function () {
+  it('should be able to create a custom Message', function () {
+    expect(() => {
+      let msgName = 'NewMessage';
+      const NewMessage = MessageClass(msgName);
+      expect(typeof NewMessage).toEqual('function');
+      expect(NewMessage.__clazz__).toEqual(msgName);
+      let nm = new NewMessage();
+    }).not.toThrow();
+  });
+
+  it('should be able to create a custom Message with parent Message', function () {
+    expect(() => {
+      let msgName = 'New2Message';
+      let parentName = 'ParentMessage';
+      const ParentMessage = MessageClass(parentName);
+      const NewMessage = MessageClass(msgName, ParentMessage);
+      expect(typeof NewMessage).toEqual('function');
+      expect(NewMessage.__clazz__).toEqual(msgName);
+      let nm = new NewMessage();
+      expect(nm instanceof NewMessage).toBeTruthy();
+      expect(nm instanceof ParentMessage).toBeTruthy();
+    }).not.toThrow();
   });
 });
 

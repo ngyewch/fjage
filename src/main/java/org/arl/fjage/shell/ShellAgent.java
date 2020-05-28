@@ -134,7 +134,10 @@ public class ShellAgent extends Agent {
   @Override
   public void init() {
     log.info("Agent "+getName()+" init");
-    if (!ephemeral) register(Services.SHELL);
+    if (!ephemeral) {
+      register(Services.SHELL);
+      setYieldDuringReceive(true);
+    }
 
     // support parameters
     add(new ParameterMessageBehavior(ShellParam.class));
@@ -445,6 +448,32 @@ public class ShellAgent extends Agent {
     String lang = engine.getClass().getSimpleName();
     if (lang.endsWith("ScriptEngine")) lang = lang.substring(0, lang.length()-"ScriptEngine".length());
     return lang;
+  }
+
+  /**
+   * Get title of the shell agent.
+   *
+   * @return title.
+   */
+  public String getTitle() {
+    return getName();
+  }
+
+  /**
+   * Get description of the shell agent.
+   *
+   * @return description.
+   */
+  public String getDescription() {
+    StringBuffer sb = new StringBuffer();
+    if (shell != null) sb.append("Interactive ");
+    else if (ephemeral) sb.append("Ephemeral ");
+    else sb.append("Non-interactive ");
+    String lang = getLanguage();
+    if (lang != null) sb.append(lang+" ");
+    sb.append("shell");
+    if (!enabled) sb.append(" (disabled)");
+    return sb.toString();
   }
 
   @Override

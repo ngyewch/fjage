@@ -49,6 +49,7 @@ public class FSMBehavior extends Behavior {
   private State initial = FINAL;
   private State state = INIT;
   private State next = INIT;
+  private State old = INIT;
 
   ///////////// Public interface
 
@@ -74,15 +75,16 @@ public class FSMBehavior extends Behavior {
 
   @Override
   public void action() {
-    State old = state;
-    state = next;
-    if (state == INIT) state = initial;
+    if (state == INIT) state = next = initial;
     if (old == state) state.action();
     else {
       if (state == REENTER) state = next = old;
       old.onExit();
       state.onEnter();
     }
+    old = state;
+    state = next;
+    if (old != state) restart();
   }
 
   @Override

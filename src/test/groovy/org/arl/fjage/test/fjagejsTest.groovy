@@ -11,12 +11,14 @@ for full license details.
 package org.arl.fjage.test
 
 import org.arl.fjage.*
+import org.arl.fjage.param.*;
 import org.arl.fjage.connectors.WebServer
 import org.arl.fjage.connectors.WebSocketConnector
 import org.arl.fjage.remote.MasterContainer
 import org.arl.fjage.shell.EchoScriptEngine
 import org.arl.fjage.shell.ShellAgent
 import org.junit.Test
+import org.arl.fjage.test.ParamServerAgent
 
 import static org.junit.Assert.assertTrue
 
@@ -46,6 +48,7 @@ class fjagejsTest {
         })
       }
     })
+    container.add("S", new ParamServerAgent());
     def ret = 0
     if (System.getProperty('manualJSTest') == null){
       // Run Jasmine based test in puppeteer.
@@ -68,6 +71,3 @@ class fjagejsTest {
     assertTrue(ret == 0 && testResult)
   }
 }
-
-
-

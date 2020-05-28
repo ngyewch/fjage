@@ -1,87 +1,7 @@
 ////// settings
 
-const TIMEOUT = 1000;              // ms, timeout to get response from to master container
 const RECONNECT_TIME = 5000;       // ms, delay between retries to connect to the server.
 
-////// global
-
-if (typeof window.fjage === 'undefined') {
-  window.fjage = {};
-  window.fjage.gateways = [];
-  window.fjage.MessageClass = MessageClass;
-  window.fjage.getGateway = function (url){
-    var f = window.fjage.gateways.filter(g => g.sock.url == url);
-    if (f.length ) return f[0];
-  };
-}
-
-////// private utilities
-
-// generate random ID with length 4*len characters
-function _guid(len) {
-  function s4() {
-    return Math.floor((1 + Math.random()) * 0x10000).toString(16).substring(1);
-  }
-  let s = s4();
-  for (var i = 0; i < len-1; i++)
-    s += s4();
-  return s;
-}
-
-// convert from base 64 to array
-function _b64toArray(base64, dtype, littleEndian=true) {
-  let s =  window.atob(base64);
-  let len = s.length;
-  let bytes = new Uint8Array(len);
-  for (var i = 0; i < len; i++)
-    bytes[i] = s.charCodeAt(i);
-  let rv = [];
-  let view = new DataView(bytes.buffer);
-  switch (dtype) {
-  case '[B': // byte array
-    for (i = 0; i < len; i++)
-      rv.push(view.getUint8(i));
-    break;
-  case '[S': // short array
-    for (i = 0; i < len; i+=2)
-      rv.push(view.getInt16(i, littleEndian));
-    break;
-  case '[I': // integer array
-    for (i = 0; i < len; i+=4)
-      rv.push(view.getInt32(i, littleEndian));
-    break;
-  case '[J': // long array
-    for (i = 0; i < len; i+=8)
-      rv.push(view.getInt64(i, littleEndian));
-    break;
-  case '[F': // float array
-    for (i = 0; i < len; i+=4)
-      rv.push(view.getFloat32(i, littleEndian));
-    break;
-  case '[D': // double array
-    for (i = 0; i < len; i+=8)
-      rv.push(view.getFloat64(i, littleEndian));
-    break;
-  default:
-    return;
-  }
-  return rv;
-}
-
-// base 64 JSON decoder
-function _decodeBase64(k, d) {
-  if (d === null) {
-    return null;
-  }
-  if (typeof d == 'object' && 'clazz' in d) {
-    let clazz = d.clazz;
-    if (clazz.startsWith('[') && clazz.length == 2 && 'data' in d) {
-      let x = _b64toArray(d.data, d.clazz);
-      if (x) d = x;
-    }
-  }
-  return d;
-}
 
 ////// interface classes
 
@@ -180,6 +100,111 @@ export class AgentID {
    */
   toJSON() {
     return (this.topic ? '#' : '') + this.name;
+  }
+
+  /**
+   * Sets parameter(s) on the Agent referred to by this AgentID.
+   *
+   * @param {(string|string[])} params - parameters name(s) to be set.
+   * @param {(Object|Object[])} values - parameters value(s) to be set.
+   * @param {number} [index=-1] - index of parameter(s) to be set.
+   * @return {Promise} - A promise which returns the new value(s) of the parameters
+   */
+  set (params, values, index=-1) {
+    if (!params) return null;
+    let msg = new ParameterReq();
+    msg.recipient = this.name;
+    if (Array.isArray(params)){
+      msg.requests = params.map((p, i) => {
+        return {
+          'param': p,
+          'value': values[i]
+        };
+      });
+    } else {
+      msg.param = params;
+      msg.value = values;
+    }
+    msg.index = Number.isInteger(index) ? index : -1;
+    return this.owner.request(msg, 5000).then(rsp => {
+      return new Promise(resolve => {
+        var ret = Array.isArray(params) ? new Array(params.length).fill(null) : null;
+        if (!rsp || rsp.perf != Performative.INFORM || !rsp.param){
+          console.warn(`Parameter(s) ${params} could not be set`);
+          resolve(ret);
+          return;
+        }
+
+        if (Array.isArray(params)){
+          if (!rsp.values) rsp.values = {};
+          if (rsp.param) rsp.values[rsp.param] = rsp.value;
+          const rvals = Object.keys(rsp.values);
+          ret = params.map((p, i) => {
+            let f = rvals.find(rv => rv.endsWith(p));
+            if (f){
+              if (rsp.values[f] != values[i]){
+                console.warn(`WARNING: Parameter ${p} set to ${rsp.values[f]}`);
+              }
+              return rsp.values[f];
+            }else null;
+          });
+        }else{
+          if (rsp.value != values){
+            console.warn(`WARNING: Parameter ${params} set to ${rsp.value}`);
+          }
+          ret = rsp.value;
+        }
+        resolve(ret);
+      });
+    });
+  }
+
+
+  /**
+   * Gets parameter(s) on the Agent referred to by this AgentID.
+   *
+   * @param {(null|string|string[])} params - parameters name(s) to be get. null implies get value of all parameters on the Agent.
+   * @param {number} [index=-1] - index of parameter(s) to be get.
+   * @return {Promise} - A promise which returns the value(s) of the parameters
+   */
+  get(params, index=-1) {
+    let msg = new ParameterReq();
+    msg.recipient = this.name;
+    if (params){
+      if (Array.isArray(params)){
+        msg.requests = params.map(p => {return {'param': p};});
+      }else{
+        msg.param = params;
+      }
+    }
+    msg.index = Number.isInteger(index) ? index : -1;
+    return this.owner.request(msg, 5000).then(rsp => {
+      return new Promise(resolve => {
+        var ret = Array.isArray(params) ? new Array(params.length).fill(null) : null;
+        if (!rsp || rsp.perf != Performative.INFORM || (params && (!rsp.param))){
+          resolve(ret);
+          return;
+        }
+        // Request for listing of all parameters.
+        if (!params){
+          if (!rsp.values) rsp.values = {};
+          if (rsp.param) rsp.values[rsp.param] = rsp.value;
+          ret = rsp.values;
+        } else if (Array.isArray(params)) {
+          if (!rsp.values) rsp.values = {};
+          if (rsp.param) rsp.values[rsp.param] = rsp.value;
+          const rvals = Object.keys(rsp.values);
+          ret = params.map(p => {
+            let f = rvals.find(rv => rv.endsWith(p));
+            return f ? rsp.values[f] : null ;
+          });
+        } else{
+          ret = rsp.value;
+        }
+
+        resolve(ret);
+      });
+    });
   }
 }
 
@@ -297,8 +322,9 @@ export class Gateway {
    * @param {string} hostname - hostname of the master container to connect to
    * @param {int} port        - port of the master container to connect to
    * @param {string} pathname - path of the master container to connect to
+   * @param {int} timeout     - timeout for fjage level messages
    */
-  constructor(hostname=window.location.hostname, port=window.location.port, pathname='/ws/') {
+  constructor(hostname=window.location.hostname, port=window.location.port, pathname='/ws/', timeout=1000) {
     var url = new URL('ws://localhost');
     url.hostname = hostname;
     url.port = port || 80;
@@ -307,6 +333,7 @@ export class Gateway {
     if (existing) return existing;
     this._firstConn = true;               // if the Gateway has managed to connect to a server before
     this._firstReConn = true;             // if the Gateway has attempted to reconnect to a server before
+    this._timeout = timeout;              // timeout for fjage level messages (agentForService etc)
     this.pending = {};                    // msgid to callback mapping for pending requests to server
     this.pendingOnOpen = [];              // list of callbacks make as soon as gateway is open
     this.subscriptions = {};              // hashset for all topics that are subscribed
@@ -435,7 +462,7 @@ export class Gateway {
         delete this.pending[rq.id];
         if (this.debug) console.log('Receive Timeout : ' + rq);
         resolve();
-      }, this.sock.readyState == this.sock.CONNECTING ? 8*TIMEOUT : TIMEOUT);
+      }, this.sock.readyState == this.sock.CONNECTING ? 8*this._timeout : this._timeout);
       this.pending[rq.id] = rsp => {
         clearTimeout(timer);
         resolve(rsp);
@@ -618,7 +645,7 @@ export class Gateway {
    * may be an agent or a topic.
    *
    * @param {Message} msg - message to be sent.
-   * @returns {Boolean} status - if sending was successful.
+   * @returns {boolean} status - if sending was successful.
    */
   send(msg) {
     msg.sender = this.aid.toJSON();
@@ -644,7 +671,7 @@ export class Gateway {
    * Sends a request and waits for a response. This method returns a {Promise} which resolves when a response is received or if no response is received after the timeout.
    *
    * @param {string} msg - message to send.
-   * @param {number} [timeout=10000] - timeout in milliseconds.
+   * @param {number} [timeout=1000] - timeout in milliseconds.
    * @return {Promise} a promise which resolves with the received response message, null on timeout.
    */
   async request(msg, timeout=1000) {
@@ -717,13 +744,22 @@ export class Gateway {
 }
 
 /**
+ * Services supported by fjage agents.
+ */
+export const Services = {
+  SHELL : 'org.arl.fjage.shell.Services.SHELL'
+};
+
+/**
  * Creates a unqualified message class based on a fully qualified name.
  * @param {string} name - fully qualified name of the message class to be created.
+ * @param {string} [parent] - Class of the parent MessageClass to inherit from.
  * @returns {function} constructor for the unqualified message class.
  */
-export function MessageClass(name) {
+export function MessageClass(name, parent=Message) {
   let sname = name.replace(/^.*\./, '');
-  window[sname] = class extends Message {
+  let pname = parent.__clazz__.replace(/^.*\./, '');
+  window[sname] = class extends window[pname] {
     constructor(params) {
       super();
       this.__clazz__ = name;
@@ -737,4 +773,88 @@ export function MessageClass(name) {
   };
   window[sname].__clazz__ = name;
   return window[sname];
+}
+
+////// global
+
+if (typeof window.fjage === 'undefined') {
+  window.fjage = {};
+  window.fjage.gateways = [];
+  window.fjage.MessageClass = MessageClass;
+  window.fjage.getGateway = function (url){
+    var f = window.fjage.gateways.filter(g => g.sock.url == url);
+    if (f.length ) return f[0];
+  };
+  Message.__clazz__ = 'org.arl.fjage.Message';
+  window['Message'] = Message;
+}
+
+const ParameterReq = MessageClass('org.arl.fjage.param.ParameterReq');
+
+////// private utilities
+
+// generate random ID with length 4*len characters
+function _guid(len) {
+  function s4() {
+    return Math.floor((1 + Math.random()) * 0x10000).toString(16).substring(1);
+  }
+  let s = s4();
+  for (var i = 0; i < len-1; i++)
+    s += s4();
+  return s;
+}
+
+// convert from base 64 to array
+function _b64toArray(base64, dtype, littleEndian=true) {
+  let s =  window.atob(base64);
+  let len = s.length;
+  let bytes = new Uint8Array(len);
+  for (var i = 0; i < len; i++)
+    bytes[i] = s.charCodeAt(i);
+  let rv = [];
+  let view = new DataView(bytes.buffer);
+  switch (dtype) {
+  case '[B': // byte array
+    for (i = 0; i < len; i++)
+      rv.push(view.getUint8(i));
+    break;
+  case '[S': // short array
+    for (i = 0; i < len; i+=2)
+      rv.push(view.getInt16(i, littleEndian));
+    break;
+  case '[I': // integer array
+    for (i = 0; i < len; i+=4)
+      rv.push(view.getInt32(i, littleEndian));
+    break;
+  case '[J': // long array
+    for (i = 0; i < len; i+=8)
+      rv.push(view.getInt64(i, littleEndian));
+    break;
+  case '[F': // float array
+    for (i = 0; i < len; i+=4)
+      rv.push(view.getFloat32(i, littleEndian));
+    break;
+  case '[D': // double array
+    for (i = 0; i < len; i+=8)
+      rv.push(view.getFloat64(i, littleEndian));
+    break;
+  default:
+    return;
+  }
+  return rv;
+}
+
+// base 64 JSON decoder
+function _decodeBase64(k, d) {
+  if (d === null) {
+    return null;
+  }
+  if (typeof d == 'object' && 'clazz' in d) {
+    let clazz = d.clazz;
+    if (clazz.startsWith('[') && clazz.length == 2 && 'data' in d) {
+      let x = _b64toArray(d.data, d.clazz);
+      if (x) d = x;
+    }
+  }
+  return d;
 }

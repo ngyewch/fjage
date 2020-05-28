@@ -87,7 +87,7 @@ public class Agent implements Runnable, TimestampProvider, Messenger {
   private Platform platform = null;
   private Container container = null;
   private MessageQueue queue = new MessageQueue(256);
-  private boolean yieldDuringReceive = true;
+  private boolean yieldDuringReceive = false;
   protected long tid = -1;
   protected Thread thread = null;
   protected boolean ignoreExceptions = false;
@@ -411,10 +411,10 @@ public class Agent implements Runnable, TimestampProvider, Messenger {
   }
 
   /**
-   * Enables/disables processing of messages during a blocking receive(). Until fjage 1.6,
-   * incoming message processing was suspended during receive(). From fjage 1.7, incoming
-   * messages are processed while waiting to receive intended message. This can be disabled,
-   * if desired for backward compatibility.
+   * Enables/disables processing of messages during a blocking receive().
+   *
+   * Experimental implementation. Disabled by default for fjåge 1.7, except in the
+   * shell agent. In fjåge 1.8, we expect this functionality to be fully enabled.
    *
    * @param b true to process messages while waiting, false to disable processing.
    */
@@ -435,7 +435,7 @@ public class Agent implements Runnable, TimestampProvider, Messenger {
     if (Thread.currentThread().getId() != tid)
       throw new FjageException("receive() should only be called from agent thread");
     long deadline = 0;
-    queue.commit(exclusions);
+    if (timeout != NON_BLOCKING) queue.commit(exclusions);
     Message m = queue.get(filter);
     if (m == null && timeout != NON_BLOCKING) {
       if (timeout != BLOCKING) deadline = currentTimeMillis() + timeout;
