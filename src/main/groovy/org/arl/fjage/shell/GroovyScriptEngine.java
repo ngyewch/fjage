@@ -396,8 +396,8 @@ public class GroovyScriptEngine implements ScriptEngine {
 
   private void error(Throwable ex) {
     if (ex instanceof GroovyBugError) ex = resolveGroovyBug(ex);
-    log.log(Level.WARNING, "Groovy script execution failed", ex);
     if (out != null) out.error(ex);
+    else log.log(Level.WARNING, "Groovy execution failed", ex);
   }
 
   private Throwable resolveGroovyBug(Throwable ex) {

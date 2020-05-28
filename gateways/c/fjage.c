@@ -1,6 +1,6 @@
 /******************************************************************************
 
-Copyright (c) 2018-2019, Mandar Chitre
+Copyright (c) 2018-2020, Mandar Chitre
 
 This file is part of fjage which is released under Simplified BSD License.
 See file LICENSE.txt or go to http://www.opensource.org/licenses/BSD-3-Clause
@@ -11,19 +11,61 @@ for full license details.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+
+#ifdef _WIN32
+#pragma comment(lib, "ws2_32.lib")
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+#include <io.h>
+#include <winsock2.h>
+#include <Ws2tcpip.h>
+#else
+#include <unistd.h>
 #include <netdb.h>
 #include <termios.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/poll.h>
 #include <netinet/in.h>
+#endif
+
 #include "fjage.h"
 #include "jsmn.h"
 #include "b64.h"
+
+// Interruptable poll_data() is implemented using 3 APIs for platform compatibility.
+// The 3 options are listed below, in order of computational efficiency:
+//
+// 1. Define USE_POLL on UNIX-style OS with support for IPC pipes and poll()
+// 2. Define USE_SELECT on use select() instead of poll() to wait for data
+// 3. Define USE_IOCTL to use ioctl() to check for data availability
+
+#ifdef _WIN32
+#define USE_SELECT
+#else
+#define USE_POLL
+#endif
+//#define USE_IOCTL
+
+#if !defined(USE_POLL) && !defined(USE_SELECT) && !defined(USE_IOCTL)
+  #error Define one of USE_POLL, USE_SELECT or USE_IOCTL
+#endif
+
+#ifdef USE_POLL
+#include <sys/poll.h>
+  #if defined(USE_SELECT) || defined(USE_IOCTL)
+  #error Do not define USE_SELECT or USE_IOCTL when using USE_POLL
+  #endif
+#endif
+
+#ifdef USE_IOCTL
+#include <sys/ioctl.h>
+  #ifdef USE_SELECT
+  #error Do not define USE_SELECT when using USE_IOCTL
+  #endif
+#endif
 
 //// prototypes
 
@@ -47,8 +89,48 @@ static void generate_uuid(char* uuid) {
 
 static int writes(int fd, const char* s) {
   int n = strlen(s);
+#ifdef _WIN32
+  return send(fd, s, n, 0);
+#else
   return write(fd, s, n);
+#endif
 }
+
+#ifdef _WIN32
+int gettimeofday(struct timeval * tp, struct timezone * tzp)
+{
+    // Note: some broken versions only have 8 trailing zero's, the correct epoch has 9 trailing zero's
+    // This magic number is the number of 100 nanosecond intervals since January 1, 1601 (UTC)
+    // until 00:00:00 January 1, 1970
+    static const uint64_t EPOCH = ((uint64_t) 116444736000000000ULL);
+
+    SYSTEMTIME  system_time;
+    FILETIME    file_time;
+    uint64_t    time;
+
+    GetSystemTime( &system_time );
+    SystemTimeToFileTime( &system_time, &file_time );
+    time =  ((uint64_t)file_time.dwLowDateTime )      ;
+    time += ((uint64_t)file_time.dwHighDateTime) << 32;
+
+    tp->tv_sec  = (long) ((time - EPOCH) / 10000000L);
+    tp->tv_usec = (long) (system_time.wMilliseconds * 1000);
+    return 0;
+}
+
+void usleep(__int64 usec)
+{
+    HANDLE timer;
+    LARGE_INTEGER ft;
+
+    ft.QuadPart = -(10*usec); // Convert to 100 nanosecond interval, negative value indicates relative time
+
+    timer = CreateWaitableTimer(NULL, TRUE, NULL);
+    SetWaitableTimer(timer, &ft, 0, NULL, NULL, 0);
+    WaitForSingleObject(timer, INFINITE);
+    CloseHandle(timer);
+}
+#endif
 
 static long get_time_ms(void) {
   struct timeval tv;
@@ -63,9 +145,23 @@ static long get_time_ms(void) {
 #define QUEUE_LEN         1024
 #define BUFLEN            65536
 
+#define PARAM_REQ         "org.arl.fjage.param.ParameterReq"
+#define PARAM_TIMEOUT     1000
+
+// poll_data() API return values
+#define DATA_AVAILABLE      0
+#define TIMED_OUT          -1
+#define INTERRUPTED        -2
+
+#define POLL_DELAY         10000  // us
+
 typedef struct {
   int sockfd;
+#ifdef USE_POLL
   int intfd[2];       // self-pipe used to break the poll on sockfd
+#else
+  int intr;
+#endif
   fjage_aid_t aid;
   char sublist[SUBLIST_LEN];
   int buflen;
@@ -77,6 +173,72 @@ typedef struct {
   int mqueue_head;
   int mqueue_tail;
 } _fjage_gw_t;
+
+static int flush_interrupts(_fjage_gw_t* fgw) {
+  int rv = 0;
+#ifdef USE_POLL
+  uint8_t dummy;
+  while (read(fgw->intfd[0], &dummy, 1) > 0) rv++;
+#else
+  rv = fgw->intr;
+  fgw->intr = 0;
+#endif
+  return rv;
+}
+
+static int interrupt(_fjage_gw_t* fgw) {
+#ifdef USE_POLL
+  uint8_t dummy = 1;
+  if (write(fgw->intfd[1], &dummy, 1) < 0) return -1;
+#else
+  fgw->intr = 1;
+#endif
+  return 0;
+}
+
+static int poll_data(_fjage_gw_t* fgw, long timeout) {
+#ifdef USE_POLL
+  struct pollfd fds[2];
+  memset(fds, 0, sizeof(fds));
+  fds[0].fd = fgw->sockfd;
+  fds[0].events = POLLIN;
+  fds[1].fd = fgw->intfd[0];
+  fds[1].events = POLLIN;
+  int rv = poll(fds, 2, timeout);
+  if (rv <= 0) return TIMED_OUT;
+  if ((fds[1].revents & POLLIN) == 0) return DATA_AVAILABLE;
+  flush_interrupts(fgw);
+  return INTERRUPTED;
+#else
+  long t = get_time_ms();
+  long t1 = t + timeout;
+  while (t <= t1) {
+  #ifdef USE_IOCTL
+    int rv;
+    ioctl(fgw->sockfd, FIONREAD, &rv);
+    if (rv < 0) rv = 0;
+  #else
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(fgw->sockfd, &fds);
+    struct timeval tval;
+    tval.tv_sec = 0;
+    tval.tv_usec = POLL_DELAY;
+    int rv = select(fgw->sockfd+1, &fds, NULL, NULL, &tval);
+  #endif
+    if (rv) return DATA_AVAILABLE;
+    if (fgw->intr) {
+      fgw->intr = 0;
+      return INTERRUPTED;
+    }
+  #ifdef USE_IOCTL
+    usleep(POLL_DELAY);
+  #endif
+    t = get_time_ms();
+  }
+  return TIMED_OUT;
+#endif
+}
 
 static void mqueue_put(fjage_gw_t gw, fjage_msg_t msg) {
   if (gw == NULL) return;
@@ -230,24 +392,20 @@ static bool json_process(fjage_gw_t gw, char* json, const char* id) {
   return rv;
 }
 
-/// @return               -1 if interrupted; 0 otherwise
+/// @return -1 if interrupted, 0 otherwise
 static int json_reader(fjage_gw_t gw, const char* id, long timeout) {
   if (gw == NULL) return -1;
   _fjage_gw_t* fgw = gw;
   long t0 = get_time_ms();
-  uint8_t dummy;
-  struct pollfd fds[2];
-  memset(fds, 0, sizeof(fds));
-  fds[0].fd = fgw->sockfd;
-  fds[0].events = POLLIN;
-  fds[1].fd = fgw->intfd[0];
-  fds[1].events = POLLIN;
-  int rv = poll(fds, 2, timeout);
-  if (rv <= 0) return 0;
-  if ((fds[1].revents & POLLIN) == 0) {
+  int rv = poll_data(fgw, timeout);
+  if (rv == DATA_AVAILABLE) {
     int n;
     bool done = false;
+#ifdef _WIN32
+    while ((n = recv(fgw->sockfd, fgw->buf + fgw->head, fgw->buflen - fgw->head, 0)) > 0) {
+#else
     while ((n = read(fgw->sockfd, fgw->buf + fgw->head, fgw->buflen - fgw->head)) > 0) {
+#endif
       int bol = 0;
       for (int i = fgw->head; i < fgw->head + n; i++) {
         if (fgw->buf[i] == '\n') {
@@ -272,15 +430,11 @@ static int json_reader(fjage_gw_t gw, const char* id, long timeout) {
       if (done) break;
       long timeout1 = t0+timeout - get_time_ms();
       if (timeout1 <= 0) break;
-      rv = poll(fds, 2, timeout1);
-      if (rv <= 0) break;
-      if ((fds[1].revents & POLLIN) != 0) break;
+      rv = poll_data(fgw, timeout1);
+      if (rv != DATA_AVAILABLE) break;
     }
   }
-  rv = 0;
-  while (read(fgw->intfd[0], &dummy, 1) > 0)
-    rv = -1;
-  return rv;
+  return (rv == INTERRUPTED) ? -1 : 0;
 }
 
 static void update_watch(_fjage_gw_t* fgw) {
@@ -320,6 +474,10 @@ bool fjage_is_subscribed(fjage_gw_t gw, const fjage_aid_t topic) {
 }
 
 fjage_gw_t fjage_tcp_open(const char* hostname, int port) {
+#ifdef _WIN32
+  WSADATA wsaData;
+  if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) return NULL;
+#endif
   _fjage_gw_t* fgw = calloc(1, sizeof(_fjage_gw_t));
   if (fgw == NULL) return NULL;
   fgw->buf = malloc(BUFLEN);
@@ -352,14 +510,24 @@ fjage_gw_t fjage_tcp_open(const char* hostname, int port) {
     free(fgw);
     return NULL;
   }
+#ifdef _WIN32
+  long NONBLOCK_MODE = 1;
+  ioctlsocket(fgw->sockfd, FIONBIO, &NONBLOCK_MODE);
+#else
+  fcntl(fgw->sockfd, F_SETFL, O_NONBLOCK);
+#endif
+
+#ifdef USE_POLL
   if (pipe(fgw->intfd) < 0) {
     close(fgw->sockfd);
     free(fgw->buf);
     free(fgw);
     return NULL;
   }
-  fcntl(fgw->sockfd, F_SETFL, O_NONBLOCK);
   fcntl(fgw->intfd[0], F_SETFL, O_NONBLOCK);
+#else
+  fgw->intr = 0;
+#endif
   char s[64];
   sprintf(s, "CGatewayAgent@%08x", rand());
   fgw->aid = fjage_aid_create(s);
@@ -367,6 +535,8 @@ fjage_gw_t fjage_tcp_open(const char* hostname, int port) {
   update_watch(fgw);
   return fgw;
 }
+
+#ifndef _WIN32
 
 fjage_gw_t fjage_rs232_open(const char* devname, int baud, const char* settings) {
   if (settings != NULL && strcmp(settings, "N81")) return NULL;
@@ -414,6 +584,7 @@ fjage_gw_t fjage_rs232_open(const char* devname, int baud, const char* settings)
   cfsetspeed(&options, baud);
   tcsetattr(fgw->sockfd, TCSANOW, &options);
   tcflush(fgw->sockfd, TCIOFLUSH);
+#ifdef USE_POLL
   if (pipe(fgw->intfd) < 0) {
     close(fgw->sockfd);
     free(fgw->buf);
@@ -421,6 +592,9 @@ fjage_gw_t fjage_rs232_open(const char* devname, int baud, const char* settings)
     return NULL;
   }
   fcntl(fgw->intfd[0], F_SETFL, O_NONBLOCK);
+#else
+  fgw->intr = 0;
+#endif
   char s[64];
   sprintf(s, "CGatewayAgent@%08x", rand());
   fgw->aid = fjage_aid_create(s);
@@ -436,15 +610,27 @@ int fjage_rs232_wakeup(const char* devname, int baud, const char* settings) {
   return 0;
 }
 
+#endif
+
 int fjage_close(fjage_gw_t gw) {
-  if (gw == NULL) return -1;
-  _fjage_gw_t* fgw = gw;
-  close(fgw->sockfd);
-  close(fgw->intfd[0]);
-  close(fgw->intfd[1]);
-  fjage_aid_destroy(fgw->aid);
-  free(fgw->buf);
-  free(fgw);
+  if (gw != NULL) {
+    _fjage_gw_t* fgw = gw;
+#ifdef _WIN32
+    closesocket(fgw->sockfd);
+#else
+    close(fgw->sockfd);
+#endif
+#ifdef USE_POLL
+    close(fgw->intfd[0]);
+    close(fgw->intfd[1]);
+#endif
+    fjage_aid_destroy(fgw->aid);
+    free(fgw->buf);
+    free(fgw);
+  }
+#ifdef _WIN32
+  WSACleanup();
+#endif
   return 0;
 }
 
@@ -507,8 +693,7 @@ fjage_aid_t fjage_agent_for_service(fjage_gw_t gw, const char* service)  {
   writes(fgw->sockfd, "\"}\n");
   fgw->aid_count = 0;
   fgw->aids = NULL;
-  uint8_t dummy;
-  while (read(fgw->intfd[0], &dummy, 1) > 0);
+  flush_interrupts(fgw);
   json_reader(gw, uuid, 1000);
   if (fgw->aid_count == 0) return NULL;
   return (fjage_aid_t)(fgw->aids);
@@ -526,8 +711,7 @@ int fjage_agents_for_service(fjage_gw_t gw, const char* service, fjage_aid_t* ag
   writes(fgw->sockfd, "\"}\n");
   fgw->aid_count = 0;
   fgw->aids = NULL;
-  uint8_t dummy;
-  while (read(fgw->intfd[0], &dummy, 1) > 0);
+  flush_interrupts(fgw);
   json_reader(gw, uuid, 1000);
   if (fgw->aid_count == 0) return 0;
   for (int i = 0; i < fgw->aid_count; i++) {
@@ -553,11 +737,10 @@ int fjage_send(fjage_gw_t gw, const fjage_msg_t msg) {
 
 fjage_msg_t fjage_receive(fjage_gw_t gw, const char* clazz, const char* id, long timeout) {
   _fjage_gw_t* fgw = gw;
-  uint8_t dummy;
   long t0 = get_time_ms();
   long timeout1 = timeout;
   fjage_msg_t msg = mqueue_get(gw, clazz, id);
-  while (read(fgw->intfd[0], &dummy, 1) > 0);
+  flush_interrupts(fgw);
   while (msg == NULL && timeout1 > 0) {
     if (json_reader(gw, NULL, timeout1) < 0) break;
     msg = mqueue_get(gw, clazz, id);
@@ -568,11 +751,10 @@ fjage_msg_t fjage_receive(fjage_gw_t gw, const char* clazz, const char* id, long
 
 fjage_msg_t fjage_receive_any(fjage_gw_t gw, const char** clazzes, int clazzlen, long timeout) {
     _fjage_gw_t* fgw = gw;
-  uint8_t dummy;
   long t0 = get_time_ms();
   long timeout1 = timeout;
   fjage_msg_t msg = mqueue_get_any(gw, clazzes, clazzlen);
-  while (read(fgw->intfd[0], &dummy, 1) > 0);
+  flush_interrupts(fgw);
   while (msg == NULL && timeout1 > 0) {
     if (json_reader(gw, NULL, timeout1) < 0) break;
     msg = mqueue_get_any(gw, clazzes, clazzlen);
@@ -596,8 +778,7 @@ fjage_msg_t fjage_request(fjage_gw_t gw, const fjage_msg_t request, long timeout
 int fjage_interrupt(fjage_gw_t gw) {
   if (gw == NULL) return -1;
   _fjage_gw_t* fgw = gw;
-  uint8_t dummy = 1;
-  if (write(fgw->intfd[1], &dummy, 1) < 0) return -1;
+  if (interrupt(fgw) < 0) return -1;
   return 0;
 }
 
@@ -681,7 +862,7 @@ static void msg_read_json(fjage_msg_t msg, const char* s) {
   jsmn_init(&parser);
   m->ntokens = jsmn_parse(&parser, m->data, strlen(m->data), m->tokens, n);
   m->data_len = -1;
-  for (int i = 1; i < m->ntokens; i+=2) {
+  for (int i = 1; i < m->ntokens; i += 1+m->tokens[i].size) {
     char* t = m->data + m->tokens[i].start;
     t[m->tokens[i].end-m->tokens[i].start] = 0;
     if (!strcmp(t, "clazz") && m->clazz[0] == 0) {
@@ -775,7 +956,11 @@ static void fjage_msg_write_json(fjage_gw_t gw, fjage_msg_t msg) {
     char* p = m->data;
     int n = strlen(m->data)-2;
     while (n > 0) {
+#ifdef _WIN32
+      int rv = send(fd, p, n, 0);
+#else
       int rv = write(fd, p, n);
+#endif
       if (rv < 0) {
         if (errno == EAGAIN) usleep(10000);
         else break;
@@ -879,6 +1064,7 @@ const char* fjage_msg_get_string(fjage_msg_t msg, const char* key) {
     if (m->tokens[i].type == JSMN_STRING && (m->tokens[i+1].type == JSMN_STRING || m->tokens[i+1].type == JSMN_PRIMITIVE) && !strcmp(key, t)) {
       t = m->data + m->tokens[i+1].start;
       t[m->tokens[i+1].end-m->tokens[i+1].start] = 0;
+      if (m->tokens[i+1].type == JSMN_PRIMITIVE && !strcmp(t, "null")) t = NULL;
       return t;
     }
   }
@@ -1007,4 +1193,149 @@ void fjage_msg_destroy(fjage_msg_t msg) {
   free(m->data);
   free(m->tokens);
   free(msg);
+}
+
+int fjage_param_get_int(fjage_gw_t gw, fjage_aid_t aid, const char* param, int ndx, int defval) {
+  int v = defval;
+  fjage_msg_t msg = fjage_msg_create(PARAM_REQ, FJAGE_REQUEST);
+  fjage_msg_set_recipient(msg, aid);
+  fjage_msg_add_int(msg, "index", ndx);
+  fjage_msg_add_string(msg, "param", param);
+  msg = fjage_request(gw, msg, PARAM_TIMEOUT);
+  if (msg != NULL) {
+    if (fjage_msg_get_performative(msg) == FJAGE_INFORM) v = fjage_msg_get_int(msg, "value", defval);
+    fjage_msg_destroy(msg);
+  }
+  return v;
+}
+
+long fjage_param_get_long(fjage_gw_t gw, fjage_aid_t aid, const char* param, int ndx, long defval) {
+  long v = defval;
+  fjage_msg_t msg = fjage_msg_create(PARAM_REQ, FJAGE_REQUEST);
+  fjage_msg_set_recipient(msg, aid);
+  fjage_msg_add_int(msg, "index", ndx);
+  fjage_msg_add_string(msg, "param", param);
+  msg = fjage_request(gw, msg, PARAM_TIMEOUT);
+  if (msg != NULL) {
+    if (fjage_msg_get_performative(msg) == FJAGE_INFORM) v = fjage_msg_get_long(msg, "value", defval);
+    fjage_msg_destroy(msg);
+  }
+  return v;
+}
+
+float fjage_param_get_float(fjage_gw_t gw, fjage_aid_t aid, const char* param, int ndx, float defval) {
+  float v = defval;
+  fjage_msg_t msg = fjage_msg_create(PARAM_REQ, FJAGE_REQUEST);
+  fjage_msg_set_recipient(msg, aid);
+  fjage_msg_add_int(msg, "index", ndx);
+  fjage_msg_add_string(msg, "param", param);
+  msg = fjage_request(gw, msg, PARAM_TIMEOUT);
+  if (msg != NULL) {
+    if (fjage_msg_get_performative(msg) == FJAGE_INFORM) v = fjage_msg_get_float(msg, "value", defval);
+    fjage_msg_destroy(msg);
+  }
+  return v;
+}
+
+bool fjage_param_get_bool(fjage_gw_t gw, fjage_aid_t aid, const char* param, int ndx, bool defval) {
+  bool v = defval;
+  fjage_msg_t msg = fjage_msg_create(PARAM_REQ, FJAGE_REQUEST);
+  fjage_msg_set_recipient(msg, aid);
+  fjage_msg_add_int(msg, "index", ndx);
+  fjage_msg_add_string(msg, "param", param);
+  msg = fjage_request(gw, msg, PARAM_TIMEOUT);
+  if (msg != NULL) {
+    if (fjage_msg_get_performative(msg) == FJAGE_INFORM) v = fjage_msg_get_bool(msg, "value", defval);
+    fjage_msg_destroy(msg);
+  }
+  return v;
+}
+
+const char* fjage_param_get_string(fjage_gw_t gw, fjage_aid_t aid, const char* param, int ndx) {
+  const char* v = NULL;
+  fjage_msg_t msg = fjage_msg_create(PARAM_REQ, FJAGE_REQUEST);
+  fjage_msg_set_recipient(msg, aid);
+  fjage_msg_add_int(msg, "index", ndx);
+  fjage_msg_add_string(msg, "param", param);
+  msg = fjage_request(gw, msg, PARAM_TIMEOUT);
+  if (msg != NULL) {
+    if (fjage_msg_get_performative(msg) == FJAGE_INFORM) v = fjage_msg_get_string(msg, "value");
+    fjage_msg_destroy(msg);
+  }
+  return v;
+}
+
+int fjage_param_set_int(fjage_gw_t gw, fjage_aid_t aid, const char* param, int value, int ndx) {
+  int rv = -1;
+  fjage_msg_t msg = fjage_msg_create(PARAM_REQ, FJAGE_REQUEST);
+  fjage_msg_set_recipient(msg, aid);
+  fjage_msg_add_int(msg, "index", ndx);
+  fjage_msg_add_string(msg, "param", param);
+  fjage_msg_add_int(msg, "value", value);
+  msg = fjage_request(gw, msg, PARAM_TIMEOUT);
+  if (msg != NULL) {
+    if (fjage_msg_get_performative(msg) == FJAGE_INFORM) rv = 0;
+    fjage_msg_destroy(msg);
+  }
+  return rv;
+}
+
+int fjage_param_set_long(fjage_gw_t gw, fjage_aid_t aid, const char* param, long value, int ndx) {
+  int rv = -1;
+  fjage_msg_t msg = fjage_msg_create(PARAM_REQ, FJAGE_REQUEST);
+  fjage_msg_set_recipient(msg, aid);
+  fjage_msg_add_int(msg, "index", ndx);
+  fjage_msg_add_string(msg, "param", param);
+  fjage_msg_add_long(msg, "value", value);
+  msg = fjage_request(gw, msg, PARAM_TIMEOUT);
+  if (msg != NULL) {
+    if (fjage_msg_get_performative(msg) == FJAGE_INFORM) rv = 0;
+    fjage_msg_destroy(msg);
+  }
+  return rv;
+}
+
+int fjage_param_set_float(fjage_gw_t gw, fjage_aid_t aid, const char* param, float value, int ndx) {
+  int rv = -1;
+  fjage_msg_t msg = fjage_msg_create(PARAM_REQ, FJAGE_REQUEST);
+  fjage_msg_set_recipient(msg, aid);
+  fjage_msg_add_int(msg, "index", ndx);
+  fjage_msg_add_string(msg, "param", param);
+  fjage_msg_add_float(msg, "value", value);
+  msg = fjage_request(gw, msg, PARAM_TIMEOUT);
+  if (msg != NULL) {
+    if (fjage_msg_get_performative(msg) == FJAGE_INFORM) rv = 0;
+    fjage_msg_destroy(msg);
+  }
+  return rv;
+}
+
+int fjage_param_set_bool(fjage_gw_t gw, fjage_aid_t aid, const char* param, bool value, int ndx) {
+  int rv = -1;
+  fjage_msg_t msg = fjage_msg_create(PARAM_REQ, FJAGE_REQUEST);
+  fjage_msg_set_recipient(msg, aid);
+  fjage_msg_add_int(msg, "index", ndx);
+  fjage_msg_add_string(msg, "param", param);
+  fjage_msg_add_bool(msg, "value", value);
+  msg = fjage_request(gw, msg, PARAM_TIMEOUT);
+  if (msg != NULL) {
+    if (fjage_msg_get_performative(msg) == FJAGE_INFORM) rv = 0;
+    fjage_msg_destroy(msg);
+  }
+  return rv;
+}
+
+int fjage_param_set_string(fjage_gw_t gw, fjage_aid_t aid, const char* param, const char* value, int ndx) {
+  int rv = -1;
+  fjage_msg_t msg = fjage_msg_create(PARAM_REQ, FJAGE_REQUEST);
+  fjage_msg_set_recipient(msg, aid);
+  fjage_msg_add_int(msg, "index", ndx);
+  fjage_msg_add_string(msg, "param", param);
+  fjage_msg_add_string(msg, "value", value);
+  msg = fjage_request(gw, msg, PARAM_TIMEOUT);
+  if (msg != NULL) {
+    if (fjage_msg_get_performative(msg) == FJAGE_INFORM) rv = 0;
+    fjage_msg_destroy(msg);
+  }
+  return rv;
 }
